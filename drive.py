@@ -8,6 +8,7 @@ import numpy as np
 from acquisition import Source
 from analysis import Predictor, summary
 from signals import CHANNELS, extract
+from vigilance import VigilanceMonitor
 
 
 def run(args):
@@ -22,12 +23,15 @@ def run(args):
         font = pg.font.Font(None, 28)
         clock = pg.time.Clock()
         rng = random.Random(args.seed)
-        source = Source(args.mode, args.port, args.imu, args.seed)
+        source = Source(args.mode, args.port, args.imu, args.seed, args.demo_fatigue)
         meta = dict(mode=args.mode, fs=source.fs, channels=CHANNELS, calibration=args.calibration,
-                    seed=args.seed, response_timeout_s=4, board_variant="imu" if args.imu else "standard")
+                    seed=args.seed, demo_fatigue=args.demo_fatigue, response_timeout_s=4, board_variant="imu" if args.imu else "standard")
         (path/"session.json").write_text(json.dumps(meta, indent=2))
         history = np.empty((0, 9))
         predictor = Predictor(args.calibration)
+        monitor = VigilanceMonitor(calibration_windows=max(3, min(8, args.calibration)))
+        last_vigilance = {"state": "CALIBRATING", "score": None, "alert": False, "signal_quality": "pending"}
+        last_vigilance_update = -999.0
         start = time.perf_counter()
         due = start + 12
         current = None
@@ -50,6 +54,10 @@ def run(args):
                     samples_saved += len(chunk)
                     history = np.concatenate((history, chunk))[-12*source.fs:]
                 now = time.perf_counter()
+                if now - last_vigilance_update >= 2.0:
+                    latest_features, latest_quality = extract(history[:, 0], history[:, 1:], time.time(), source.fs)
+                    last_vigilance = monitor.update(latest_features, latest_quality)
+                    last_vigilance_update = now
                 response = None
                 for ev in pg.event.get():
                     if ev.type == pg.QUIT or (ev.type == pg.KEYDOWN and ev.key == pg.K_ESCAPE):
@@ -91,7 +99,7 @@ def run(args):
                     features, quality = extract(history[:, 0], history[:, 1:], cutoff, source.fs)
                     base, pred = predictor.predict(now-start, features)
                     current = dict(**pred, trial=len(completed)+1, cutoff_unix=cutoff, samples_saved=samples_saved, elapsed_s=now-start,
-                                   features=features, quality=quality, direction=rng.choice([-1, 1]), wrong_inputs=0)
+                                   features=features, quality=quality, vigilance=last_vigilance.copy(), direction=rng.choice([-1, 1]), wrong_inputs=0)
                 offset = 0
                 if current:
                     age = 0 if new else now-onset
@@ -106,6 +114,15 @@ def run(args):
                         pg.draw.rect(screen, (136, 144, 145), (427, py, 5, 28))
                 pg.draw.rect(screen, (78, 195, 223), (int(405+offset), 345, 50, 86), border_radius=8)
                 screen.blit(font.render(args.mode.upper()+"  |  "+feedback, True, "white"), (12, 18))
+                label = "EEG trend: " + last_vigilance["state"]
+                if last_vigilance["score"] is not None:
+                    label += f"  |  Index: {last_vigilance['score']:+.2f}"
+                color = (255, 120, 120) if last_vigilance["alert"] else (200, 225, 240)
+                screen.blit(font.render(label, True, color), (12, 49))
+                if args.demo_fatigue:
+                    screen.blit(font.render("SIMULATED FATIGUE TRANSITION: NOT A REAL DETECTOR", True, (255, 204, 95)), (12, 492))
+                if last_vigilance["alert"]:
+                    screen.blit(font.render("EEG CHANGE ALERT (EXPERIMENTAL)", True, (255, 120, 120)), (258, 98))
                 pg.display.flip()
                 if new:
                     onset = time.perf_counter()
