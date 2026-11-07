@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from .features import EEG_FEATURES, CAMERA_FEATURES, ALL_FEATURES, MONTAGE, eeg_features
 from .camera_features import EyeMonitor
+from .alerts import AlertConfig, AlertDispatcher
 
 
 class EEGReader:
@@ -29,12 +30,17 @@ class EEGReader:
             self.fs=self.source.fs
             self.buffer=collections.deque(maxlen=int(self.fs*10))
         self.last_reason='No EEG source'
+        self.last_sample_at=None
     def update(self):
         if not self.source:
             return None
         rows=self.source.read()
         if len(rows):
             self.buffer.extend(rows)
+            self.last_sample_at=time.monotonic()
+        else:
+            self.last_reason='No new EEG samples'
+            return None
         if len(self.buffer)<int(7.6*self.fs):
             self.last_reason='Collecting EEG window';return None
         recent=np.asarray(self.buffer)
@@ -55,9 +61,17 @@ def main():
     ap.add_argument('--ear-threshold',type=float,default=.20)
     ap.add_argument('--model',default='',help='Trusted, independently trained model .joblib')
     ap.add_argument('--record',default='runs/multimodal/session.csv')
+    ap.add_argument('--speak-alerts', action='store_true', help='Speak warnings through Mac selected audio output')
+    ap.add_argument('--sms-alerts', action='store_true', help='Opt in to sending real SMS; requires Twilio environment credentials')
+    ap.add_argument('--alert-phone', default=os.environ.get('NEUROGUARD_ALERT_PHONE',''), help='Recipient E.164 number')
+    ap.add_argument('--alert-cooldown', type=float, default=300.0, help='Minimum seconds between alerts')
     args=ap.parse_args()
     if args.eeg=='knight' and not args.port:ap.error('--port is required for Knight mode')
     if args.eeg=='synthetic' and args.model:ap.error('Do not run trained model on synthetic EEG')
+    if args.sms_alerts and (args.eeg != 'knight' or not args.model):
+        ap.error('SMS is allowed only with Knight EEG and an explicitly supplied trained model')
+    if args.sms_alerts and not args.alert_phone:
+        ap.error('--alert-phone or NEUROGUARD_ALERT_PHONE is required with --sms-alerts')
     import cv2
     import mediapipe as mp
     try:
@@ -81,6 +95,9 @@ def main():
     target=Path(args.record);target.parent.mkdir(parents=True,exist_ok=True)
     f=target.open('w',newline='');writer=csv.DictWriter(f,fieldnames=['timestamp','participant_id','session_id','camera_valid','eeg_valid','eeg_quality','source','risk','alert_state']+list(ALL_FEATURES));writer.writeheader()
     prev_log=0.;last_eeg_t=0.;last_eeg=None;warning_streak=0;last_alert=''
+    dispatcher = AlertDispatcher(AlertConfig(sms_enabled=args.sms_alerts,
+            speech_enabled=args.speak_alerts, recipient=args.alert_phone,
+            cooldown_seconds=args.alert_cooldown))
     try:
         reader=EEGReader(args.eeg,args.port,args.imu)
         while True:
@@ -90,7 +107,8 @@ def main():
             out=mesh.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
             landmarks=out.multi_face_landmarks[0].landmark if out.multi_face_landmarks else None
             cam_features=monitor.update(now,landmarks,w,h)
-            if now-last_eeg_t>=1:
+            fresh_eeg_window = now-last_eeg_t>=1
+            if fresh_eeg_window:
                 last_eeg=reader.update();last_eeg_t=now
             eeg_valid=last_eeg is not None
             camera_valid=cam_features is not None and cam_features['perclos'] is not None
@@ -106,10 +124,18 @@ def main():
             elif args.eeg!='none' and not eeg_valid:state='EEG UNAVAILABLE'
             elif model is None:state='FEATURE MONITORING / UNTRAINED'
             else:
-                warning_streak=warning_streak+1 if prediction>=.65 else 0
+                # Persistence must count independent ~1-second EEG windows,
+                # not individual 30-FPS camera frames.
+                if fresh_eeg_window:
+                    warning_streak=warning_streak+1 if prediction>=.65 else 0
                 state='EXPERIMENTAL WARNING' if warning_streak>=3 else 'MONITORING'
+            if state not in ('MONITORING','EXPERIMENTAL WARNING'):
+                warning_streak=0
             if state=='EXPERIMENTAL WARNING' and last_alert!=state:
                 print('\aEXPERIMENTAL WARNING: stop safely; monitoring is not validated')
+            dispatcher.update(state, genuine_hardware=(args.eeg=='knight'),
+                              validated_inputs=(eeg_valid and camera_valid and prediction is not None))
+            dispatcher.check_errors()
             last_alert=state
             vals={k:float('nan') for k in ALL_FEATURES}
             if eeg_valid:vals.update(last_eeg)
@@ -132,6 +158,7 @@ def main():
             cv2.imshow('NeuroGuard experimental EEG + eyes',frame)
             if cv2.waitKey(1)&255==ord('q'):break
     finally:
+        dispatcher.close()
         if reader:reader.close()
         cap.release();mesh.close();cv2.destroyAllWindows();f.close()
         print('Recorded',str(target))
