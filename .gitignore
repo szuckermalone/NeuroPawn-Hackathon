@@ -9,7 +9,9 @@ data/*
 # Python
 __pycache__/
 *.py[cod]
+.venv
 .venv/
+*.nosync/
 venv/
 .env
 .ipynb_checkpoints/

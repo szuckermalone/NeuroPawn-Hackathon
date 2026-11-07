@@ -1,0 +1,7 @@
+brainflow>=5.23
+PyQt6>=6.7
+pyqtgraph>=0.13.7
+numpy>=1.26
+scipy>=1.13
+pyserial>=3.5
+pytest>=8  # tests only
