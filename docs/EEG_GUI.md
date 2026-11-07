@@ -7,7 +7,7 @@ An OpenBCI-style desktop app for streaming, viewing, and recording the NeuroPawn
 ```bash
 python3 -m venv .venv.nosync && ln -s .venv.nosync .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-gui.txt
 python run_gui.py
 ```
 

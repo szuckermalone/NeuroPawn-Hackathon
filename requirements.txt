@@ -1,7 +1,8 @@
-brainflow>=5.23
-PyQt6>=6.7
-pyqtgraph>=0.13.7
-numpy>=1.26
-scipy>=1.13
-pyserial>=3.5
-pytest>=8  # tests only
+numpy>=1.26,<3
+scipy>=1.11,<2
+scikit-learn>=1.4,<2
+matplotlib>=3.8,<4
+pygame>=2.5,<3
+# NeuroPawn Knight acquisition (also needed by the GUI/recorder tests that CI runs)
+brainflow>=5.23,<6
+pyserial>=3.5,<4

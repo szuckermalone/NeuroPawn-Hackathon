@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
-from scipy import signal
+from scipy import integrate, signal
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ def relative_band_powers(f: np.ndarray, asd: np.ndarray) -> np.ndarray:
     powers = []
     for _, lo, hi in BANDS:
         m = (f >= lo) & (f < hi)
-        powers.append(np.trapezoid(psd[..., m], f[m], axis=-1) if m.sum() > 1 else np.zeros(psd.shape[:-1]))
+        powers.append(integrate.trapezoid(psd[..., m], f[m], axis=-1) if m.sum() > 1 else np.zeros(psd.shape[:-1]))
     p = np.stack(powers, axis=-1)
     tot = p.sum(axis=-1, keepdims=True)
     with np.errstate(invalid="ignore", divide="ignore"):
