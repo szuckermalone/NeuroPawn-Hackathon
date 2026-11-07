@@ -63,6 +63,7 @@ def main():
     drive.add_argument("--port")
     drive.add_argument("--imu",action="store_true")
     drive.add_argument("--joystick",action="store_true")
+    drive.add_argument("--demo-fatigue",action="store_true", help="Synthetic-only simulated EEG transition")
     drive.add_argument("--trials",type=int,default=32)
     drive.add_argument("--seed",type=int)
     public = commands.add_parser("import-cao")
@@ -70,6 +71,9 @@ def main():
     for cmd in [drive,public]:
         cmd.add_argument("--out",required=True)
         cmd.add_argument("--calibration",type=int,default=12)
+    vr = commands.add_parser("vigilance-report", help="Offline EEG trend chart from recorded session")
+    vr.add_argument("session")
+    vr.add_argument("--out", required=True)
     rep = commands.add_parser("replay")
     rep.add_argument("session")
     ev = commands.add_parser("evaluate")
@@ -79,6 +83,8 @@ def main():
     if args.command in ("drive","import-cao") and args.calibration < 3:
         p.error("Use at least 3 usable calibration trials.")
     if args.command == "drive":
+        if args.demo_fatigue and args.mode != "synthetic":
+            p.error("--demo-fatigue is only allowed with --mode synthetic.")
         if args.mode=="live" and not args.port:
             p.error("Live mode needs --port.")
         if args.trials <= args.calibration:
@@ -90,6 +96,9 @@ def main():
         convert(args)
     elif args.command=="replay":
         replay(args)
+    elif args.command=="vigilance-report":
+        from vigilance_report import make_report
+        make_report(args.session, args.out)
     else:
         evaluate(args)
 

@@ -93,3 +93,72 @@ Importer selects the eight named channels in the live order and converts MNE vol
 - [NeuroPawn BrainFlow repository](https://github.com/NeuroPawn/brainflow)
 - [Cao et al., Multi-channel EEG recordings during a sustained-attention driving task](https://doi.org/10.1038/s41597-019-0027-4)
 - [Bitbrain overview of driver fatigue and EEG](https://www.bitbrain.com/blog/eeg-driver-fatigue)
+
+## NEW: Two-hour Bitbrain-inspired EEG vigilance demonstration
+
+This extension implements an **experimental baseline-relative EEG change indicator**, not
+an EEG-trained drowsiness classifier, microsleep predictor, or validated safety device.
+Bitbrain's overview motivates monitoring theta (4–8 Hz), alpha (8–13 Hz), and beta
+(13–30 Hz), but does not provide a ready-to-deploy model or universal EEG threshold.
+
+### Fastest way to show the end-to-end system
+
+From the extracted project directory, using desktop Python 3.11 or 3.12:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python smoke.py
+python test_vigilance.py
+python main.py drive --mode synthetic --demo-fatigue --trials 8 --calibration 3 --seed 22 --out runs/demo01
+python main.py vigilance-report runs/demo01 --out reports/demo01
+```
+
+Windows: use `.venv\\Scripts\\activate` in CMD, or `.venv\\Scripts\\Activate.ps1`
+in PowerShell. Replace `python3` with `py -3.11` if appropriate.
+
+The simulator initially generates alpha-dominant EEG-like signals and then changes
+its theta/alpha/beta amplitudes starting approximately 30 seconds after launch.
+The on-screen alert is therefore a **known synthetic transition**, not a measured
+physiological state. The demonstration needs at least eight seconds of data plus
+at least three baseline feature windows. Allow ~60–90 seconds for the index to
+change; complete the simulator's steering corrections with the arrow keys.
+The new output `reports/demo01/vigilance.png` plots the baseline-relative index.
+`vigilance.csv` provides the sampled trend and quality-gating status.
+
+### What has changed
+
+- `vigilance.py`: baseline calibration, robust scaling, illustrative weighted EEG
+  feature index, temporal smoothing, persistence, and signal-quality rejection
+- `acquisition.py`: opt-in `--demo-fatigue` synthetic changes, clearly marked as fake
+- `drive.py`: live on-screen experimental EEG trend and quality-gated alerts
+- `vigilance_report.py`: offline trend reconstruction from original EEG session
+- `test_vigilance.py`: deterministic unit tests
+- `main.py`: `vigilance-report` and `--demo-fatigue` CLI options
+
+Your prior reaction-time predictor, CSV logging, public-data importer, and
+simulation remain available. Run without `--demo-fatigue` for constant synthetic
+signals. Use `--mode live` only with a compatible, vendor-supported, body-safe EEG
+acquisition setup; do not attach a generic microcontroller directly to electrodes.
+
+### Model interpretation and validation limits
+
+The index is computed from log band powers `[frontal theta, posterior alpha,
+central beta]`. During baseline collection, it stores accepted 8-second windows,
+then freezes their median and robust dispersion. The index is
+`0.5*z(theta) + 0.3*z(alpha) - 0.2*z(beta)` smoothed over three successive
+estimates. A high score sustained for three estimates triggers a visible
+experimental alert. **All weights and thresholds are illustrative engineering
+choices; they have not been derived from labeled fatigue data.** A degraded
+sensor forces `SIGNAL UNAVAILABLE` and cannot issue a new EEG warning.
+
+For a defensible model after the demo, acquire labeled EEG and independent
+behavioral sleepiness measures (such as PERCLOS, observed microsleep, or
+psychomotor vigilance outcomes), then use subject-separated testing. Do not
+claim that synthetic classification performance demonstrates real-world
+accuracy, early prediction, or driving safety. Test only when seated or in
+a simulator, not while operating a moving vehicle.
+
+Reference: [Bitbrain, How EEG is Changing Driver Fatigue Detection in Real Time
+(2025)](https://www.bitbrain.com/blog/eeg-driver-fatigue).
