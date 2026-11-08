@@ -18,6 +18,7 @@ NeuroGuard explores whether scalp EEG and camera-derived eye behaviour can provi
 - A standalone, interactive **offline EEG replay dashboard** (Plotly)
 - Optional spoken Mac alerts and SMS delivery via Twilio, with safety gates and rate limiting
 - An **OpenBCI-style live EEG GUI** (`run_gui.py`) for signal checking, value-for-value exact CSV recording, and blink/noise cleaning, see [docs/EEG_GUI.md](docs/EEG_GUI.md)
+- **Night Drive** (`run_game.py`), a deliberately monotonous driving task. The GUI runs the EEG drowsiness detector in the background and interrupts the drive with an alarm at the pre-sleep pattern; every drift, response, lapse and alert is written into the EEG recording as a marker. See [docs/EEG_GUI.md](docs/EEG_GUI.md#night-drive-the-driving-task)
 
 **Important:** The real-time camera overlay (`multimodal.live`) is **not** the same as the offline Plotly dashboard (`dashboard.py`). This release does not include a unified streaming browser dashboard. It does **not** use PiEEG-server.
 
@@ -85,11 +86,15 @@ The driving simulator, offline dashboard, and multimodal webcam monitor are **se
 │   ├── import_sadt.py          # Eight-site public EEG feature export
 │   └── alerts.py               # Mac speech and Twilio SMS
 ├── run_gui.py                  # Launches the live EEG GUI
+├── run_game.py                 # Night Drive (launch from the GUI's Drowsiness tab)
 ├── src/neuropawn_gui/
 │   ├── acquisition.py          # Board session thread; each sample read exactly once
 │   ├── recorder.py             # Lossless CSV + JSON sidecar
 │   ├── scale.py                # Exact fix for the BrainFlow <= 5.23.0 Knight uV scale
 │   ├── cleaning.py             # Real-time / offline noise and blink cleaning
+│   ├── drowsiness.py           # Theta/alpha pre-sleep + microsleep detector
+│   ├── game/                   # Night Drive (task logic + pygame front end)
+│   ├── link.py                 # GUI <-> game link and EEG marker codes
 │   ├── main_window.py, widgets.py, review.py   # GUI and recording viewer
 │   └── boards.py, integrity.py, dsp.py, ...
 ├── tests/

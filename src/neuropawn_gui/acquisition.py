@@ -36,6 +36,86 @@ BRAINFLOW_BUFFER_SAMPLES = 450_000  # ~1 h at 125 Hz
 DISPLAY_SECONDS = 60
 STALL_WARNING_S = 2.0
 RATE_WINDOW_S = 5.0
+FS_TRUE_MIN_S = 8.0
+FAULT_WINDOW_S = 3.0
+FAULT_BAD_FRACTION = 0.02     # repeated/backwards counters; a healthy Knight stream has none
+FAULT_RATE_FACTOR = 1.5       # stuck board re-sending packets ran at ~24x the nominal rate
+FAULT_ZERO_FRACTION = 0.5     # samples whose 8 channels are all exactly 0
+
+
+class StreamHealth:
+    """Rolling health of the incoming stream, so a broken run is caught in seconds."""
+
+    def __init__(self, nominal_fs: float):
+        self.nominal_fs = nominal_fs
+        self.recent: collections.deque = collections.deque()
+
+    def add(self, now: float, n: int, bad: int, zeros: int, missing: int) -> str | None:
+        self.recent.append((now, n, bad, zeros, missing))
+        while self.recent and now - self.recent[0][0] > FAULT_WINDOW_S:
+            self.recent.popleft()
+        span = now - self.recent[0][0]
+        tot = sum(r[1] for r in self.recent)
+        if tot == 0:
+            return None
+        bad_f = sum(r[2] for r in self.recent) / tot
+        zero_f = sum(r[3] for r in self.recent) / tot
+        if bad_f > FAULT_BAD_FRACTION:
+            return f"{bad_f:.0%} of packets repeated or out of order"
+        if zero_f > FAULT_ZERO_FRACTION:
+            return f"{zero_f:.0%} of samples are all-zero"
+        if span >= 1.5 and (tot - self.recent[0][1]) / span > FAULT_RATE_FACTOR * self.nominal_fs:
+            return f"packets arriving at {(tot - self.recent[0][1]) / span:,.0f}/s (expected {self.nominal_fs:g})"
+        return None
+# Crystal clocks are off by well under 1% (our Knight: +0.5%). Anything outside this band means
+# the estimate is broken (e.g. by repeated packet counters), so it's ignored rather than used to
+# re-aim the notch filter.
+FS_TRUE_MAX_DEVIATION = 0.015
+
+
+class ClockFit:
+    """Running least-squares fit of host time vs. sample index -> true sample rate.
+
+    USB delivers packets in bursts, so individual timestamps jitter by tens of ms. A
+    regression over the whole session averages that out (~0.03% after a minute).
+    Packet gaps are included in the index so drops don't bias the estimate.
+    """
+
+    def __init__(self):
+        self.n = 0
+        self.si = self.st = self.sii = self.sit = 0.0
+        self.t0: float | None = None
+        self.t_last = 0.0
+        self.next_index = 0
+
+    def add(self, timestamps: np.ndarray, gaps: np.ndarray) -> None:
+        if timestamps.size == 0:
+            return
+        if self.t0 is None:
+            self.t0 = float(timestamps[0])
+        # a repeated counter (gap -1) is treated as the same packet index, not a new one
+        inc = np.where(gaps < 0, 0, 1 + np.clip(gaps, 0, None))
+        idx = self.next_index - 1 + np.cumsum(inc)
+        self.next_index = int(idx[-1]) + 1
+        t = timestamps - self.t0
+        self.t_last = float(t[-1])
+        self.n += idx.size
+        self.si += float(idx.sum())
+        self.st += float(t.sum())
+        self.sii += float((idx * idx).sum())
+        self.sit += float((idx * t).sum())
+
+    def span_s(self) -> float:
+        return self.t_last
+
+    def rate(self) -> float | None:
+        if self.n < 2:
+            return None
+        denom = self.n * self.sii - self.si ** 2
+        if denom <= 0:
+            return None
+        slope = (self.n * self.sit - self.si * self.st) / denom  # seconds per sample
+        return 1.0 / slope if slope > 0 else None
 
 # Timing from NeuroPawn's reference code: the firmware needs time to apply each
 # register write. Configuring 8 channels takes ~16 s.
@@ -64,6 +144,10 @@ class Stats:
     gap_events: int = 0
     missing_packets: int = 0
     counter_repeats: int = 0
+    counter_backsteps: int = 0
+    # Live stream health over the last FAULT_WINDOW_S: None = OK, else a short explanation.
+    stream_fault: str | None = None
+    stream_fault_serial: int = 0
     measured_rate_hz: float = 0.0
     seconds_since_data: float = 0.0
     config_done: int = 0
@@ -76,6 +160,9 @@ class Stats:
     last_recording_path: Path | None = None
     scale_verdict: str | None = None  # last chunk: legacy (corrected) / correct / empty / unknown
     scale_unknown_chunks: int = 0
+    # Board's real sample rate, from a least-squares fit of host timestamps against the
+    # packet counter since the session started. None until FS_TRUE_MIN_S of data.
+    fs_true: float | None = None
 
 
 class AcquisitionEngine:
@@ -90,6 +177,8 @@ class AcquisitionEngine:
         self._board: BoardShim | None = None
         self._recorder: CsvRecorder | None = None
         self._rate_hist: collections.deque = collections.deque()
+        self._clock = ClockFit()
+        self._health: StreamHealth | None = None
         self._last_data_monotonic = 0.0
         self._sent_commands: list[str] = []
         self.spec: BoardSpec | None = None
@@ -124,6 +213,8 @@ class AcquisitionEngine:
         self._stop_evt.clear()
         self._cmds = queue.Queue()
         self._rate_hist.clear()
+        self._clock = ClockFit()
+        self._health = StreamHealth(self.layout.sampling_rate)
         self._last_data_monotonic = 0.0
         self._sent_commands = []
         with self._lock:
@@ -143,14 +234,21 @@ class AcquisitionEngine:
             return not self._thread.is_alive()
         return True
 
-    def start_recording(self, path: Path) -> None:
-        """Begin writing at the next chunk boundary. Only allowed once channels are configured."""
+    def start_recording(self, path: Path, extra_info: dict | None = None) -> None:
+        """Begin writing at the next chunk boundary. Only allowed once channels are configured.
+
+        ``extra_info`` is stored in the sidecar's ``board`` section (e.g. the signal check).
+        """
         if self.stats().state is not State.STREAMING:
             raise RuntimeError("Recording is only available while streaming (after channel setup).")
-        self._cmds.put(("start_rec", Path(path)))
+        self._cmds.put(("start_rec", (Path(path), extra_info or {})))
 
     def stop_recording(self) -> None:
         self._cmds.put(("stop_rec", None))
+
+    def annotate_recording(self, key: str, value) -> None:
+        """Add a field to the active recording's JSON sidecar (no-op if not recording)."""
+        self._cmds.put(("annotate", (key, value)))
 
     def insert_marker(self, value: float) -> bool:
         if value == 0:
@@ -282,8 +380,10 @@ class AcquisitionEngine:
             except queue.Empty:
                 return
             if cmd == "start_rec" and self._recorder is None:
+                arg, extra = arg
                 try:
-                    info = {"serial_port": self.port or None,
+                    info = {**extra,
+                            "serial_port": self.port or None,
                             "board_key": self.spec.key if self.spec else None,
                             "config_commands_sent": list(self._sent_commands)}
                     if self._scale is not None:
@@ -298,6 +398,11 @@ class AcquisitionEngine:
                         self._stats.state = State.STREAMING
             elif cmd == "stop_rec":
                 self._close_recorder()
+            elif cmd == "annotate" and self._recorder is not None:
+                try:
+                    self._recorder.annotate(*arg)
+                except OSError:
+                    pass
 
     def _close_recorder(self) -> None:
         rec = self._recorder
@@ -341,6 +446,13 @@ class AcquisitionEngine:
         self._last_data_monotonic = now
         n = data.shape[1]
         ts_last = float(data[layout.timestamp_row, -1])
+        self._clock.add(data[layout.timestamp_row], gaps)
+        fault = self._health.add(now, n, int((gaps < 0).sum()),
+                                 int((data[layout.eeg_rows] == 0).all(axis=0).sum()),
+                                 int(gaps[gaps > 0].sum())) if self._health else None
+        fs_true = self._clock.rate() if self._clock.span_s() >= FS_TRUE_MIN_S else None
+        if fs_true is not None and abs(fs_true / layout.sampling_rate - 1) > FS_TRUE_MAX_DEVIATION:
+            fs_true = None  # implausible: keep the nominal rate
         with self._lock:
             s = self._stats
             s.samples_received += n
@@ -358,7 +470,12 @@ class AcquisitionEngine:
             s.gap_events = tracker.gap_events
             s.missing_packets = tracker.missing_packets
             s.counter_repeats = tracker.repeat_events
+            s.counter_backsteps = tracker.backstep_events
+            if fault and not s.stream_fault:
+                s.stream_fault_serial += 1
+            s.stream_fault = fault
             s.measured_rate_hz = rate
+            s.fs_true = fs_true
             if verdict is not None:
                 s.scale_verdict = verdict
                 s.scale_unknown_chunks = self._scale.verdicts[scale.UNKNOWN]

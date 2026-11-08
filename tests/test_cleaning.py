@@ -5,7 +5,7 @@ import pytest
 from scipy import signal
 
 from neuropawn_gui.cleaning import (
-    CleaningConfig, RealtimeCleaner, artifact_mask, clean_offline, common_average, detect_blinks,
+    RealtimeCleaner, artifact_mask, clean_offline, common_average,
 )
 
 FS = 125.0

@@ -36,3 +36,35 @@ def test_repeat_is_flagged_not_counted_as_loss():
 def test_empty_chunk():
     t = SequenceTracker()
     assert t.process(np.array([])).size == 0
+
+
+def test_stale_packet_flip_is_backsteps_not_millions_missing():
+    """Real Knight fault: counter flipping 235, 236, 235, 236, ... (re-sent stale packets)."""
+    from neuropawn_gui.integrity import COUNTER_BACKSTEP
+    t = SequenceTracker()
+    gaps = t.process(np.array([235, 236] * 500))
+    assert t.missing_packets == 0 and t.gap_events == 0
+    assert t.backstep_events == 499 and (gaps == COUNTER_BACKSTEP).sum() == 499
+
+
+def test_stream_health_flags_faults_and_clears():
+    from neuropawn_gui.acquisition import StreamHealth
+    h = StreamHealth(125.0)
+    for k in range(20):                                   # healthy: 5 samples per 40 ms
+        assert h.add(k * 0.04, 5, 0, 0, 0) is None
+    msg = h.add(0.84, 5, 3, 0, 0)                          # out-of-order burst
+    assert msg is None or "out of order" in msg
+    for k in range(10):
+        msg = h.add(0.88 + k * 0.04, 5, 2, 0, 0)
+    assert "out of order" in msg
+    h2 = StreamHealth(125.0)                               # stuck board: ~3000 packets/s of zeros
+    for k in range(60):
+        msg = h2.add(k * 0.04, 120, 0, 120, 0)
+    assert "all-zero" in msg
+    h3 = StreamHealth(125.0)                               # too fast but non-zero
+    for k in range(60):
+        msg = h3.add(k * 0.04, 120, 0, 0, 0)
+    assert "arriving at" in msg
+    for k in range(120):                                   # recovers once the window is clean again
+        msg = h3.add(2.4 + k * 0.04, 5, 0, 0, 0)
+    assert msg is None

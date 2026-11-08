@@ -5,20 +5,24 @@ from __future__ import annotations
 import numpy as np
 
 COUNTER_MODULO = 256
-# gap_before value used when the counter did not advance (duplicate packet, or
-# exactly a multiple of 256 packets lost, which a 1-byte counter cannot tell apart).
-COUNTER_REPEAT = -1
+# gap_before codes for samples where the counter did not move forward by >= 1:
+COUNTER_REPEAT = -1    # counter did not advance (duplicate packet)
+COUNTER_BACKSTEP = -2  # counter went backwards (stale / re-sent packet, a board fault)
 
 
 class SequenceTracker:
-    """Track the package counter across chunks and report missing packets.
+    """Track the package counter across chunks and classify every step.
 
-    ``process`` returns, for every sample, how many packets were missing
-    immediately before it (0 = contiguous). The state carries across calls, so a
-    gap that straddles two chunks is still detected.
+    ``process`` returns, for every sample, how many packets were missing immediately
+    before it (0 = contiguous, >0 = that many lost), or a negative code for a repeat
+    or a backwards step. The state carries across calls, so a gap that straddles two
+    chunks is still detected.
 
-    Limitation: with a 1-byte counter, losing >= 256 consecutive packets is
-    indistinguishable from losing (n mod 256).
+    Steps are read as signed values in [-128, 127]. A board fault seen on our Knight,
+    where it re-sends stale packets with the counter flipping n, n+1, n, n+1 ..., is
+    therefore reported as backsteps, not as 254 "missing" packets per flip. Limitation:
+    with a 1-byte counter, losing 128 or more consecutive packets (about 1 s) can't be
+    told apart from a backwards step.
     """
 
     def __init__(self, modulo: int = COUNTER_MODULO):
@@ -27,27 +31,26 @@ class SequenceTracker:
         self.gap_events = 0
         self.missing_packets = 0
         self.repeat_events = 0
+        self.backstep_events = 0
 
     def process(self, package_nums: np.ndarray) -> np.ndarray:
         pkg = np.rint(np.asarray(package_nums, dtype=np.float64)).astype(np.int64) % self.modulo
         n = pkg.size
-        gaps = np.zeros(n, dtype=np.int64)
         if n == 0:
-            return gaps
+            return np.zeros(0, dtype=np.int64)
         prev = np.empty(n, dtype=np.int64)
         prev[1:] = pkg[:-1]
-        if self.prev is None:
-            prev[0] = (pkg[0] - 1) % self.modulo  # first sample ever: no gap by definition
-        else:
-            prev[0] = self.prev
-        step = (pkg - prev) % self.modulo
+        prev[0] = (pkg[0] - 1) % self.modulo if self.prev is None else self.prev
+        half = self.modulo // 2
+        step = (pkg - prev + half) % self.modulo - half      # signed step in [-128, 127]
         gaps = step - 1
-        repeats = step == 0
-        gaps[repeats] = COUNTER_REPEAT
+        gaps[step == 0] = COUNTER_REPEAT
+        gaps[step < 0] = COUNTER_BACKSTEP
 
         real_gaps = gaps > 0
         self.gap_events += int(real_gaps.sum())
         self.missing_packets += int(gaps[real_gaps].sum())
-        self.repeat_events += int(repeats.sum())
+        self.repeat_events += int((gaps == COUNTER_REPEAT).sum())
+        self.backstep_events += int((gaps == COUNTER_BACKSTEP).sum())
         self.prev = int(pkg[-1])
         return gaps

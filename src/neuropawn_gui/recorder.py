@@ -61,6 +61,7 @@ class CsvRecorder:
         self.gap_events = 0
         self.missing_packets = 0
         self.repeat_events = 0
+        self.backstep_events = 0
         self.marker_count = 0
         self.scale_verdicts: dict[str, int] = {}
         self.first_timestamp: float | None = None
@@ -98,7 +99,8 @@ class CsvRecorder:
                                   "for evenly spaced sample timing.",
                 "package_num": "Board's 8-bit packet counter (0-255, wraps).",
                 "gap_before": "Packets missing immediately before this row according to package_num "
-                              "(0 = contiguous, -1 = counter repeated).",
+                              "(0 = contiguous, -1 = counter repeated, -2 = counter went backwards: "
+                              "a stale/re-sent packet from a board fault).",
                 "chN_uV": "EEG channel N in microvolts, unfiltered. For Knight boards, values from BrainFlow "
                           "<= 5.23.0 are rescaled exactly to the corrected scale (see board.scale_correction); "
                           "otherwise exactly as returned by BrainFlow.",
@@ -164,7 +166,8 @@ class CsvRecorder:
         g = np.asarray(gap_before)
         self.gap_events += int((g > 0).sum())
         self.missing_packets += int(g[g > 0].sum())
-        self.repeat_events += int((g < 0).sum())
+        self.repeat_events += int((g == -1).sum())
+        self.backstep_events += int((g == -2).sum())
         self.marker_count += int(np.count_nonzero(data[L.marker_row]))
         if scale_verdict is not None:
             self.scale_verdicts[scale_verdict] = self.scale_verdicts.get(scale_verdict, 0) + 1
@@ -172,6 +175,11 @@ class CsvRecorder:
             self.first_timestamp = ts[0]
         self.last_timestamp = ts[-1]
         return n
+
+    def annotate(self, key: str, value) -> None:
+        """Add or replace a field in the sidecar's ``board`` section (e.g. the linked game session)."""
+        self._meta["board"][key] = value
+        self._write_sidecar()
 
     def close(self) -> dict:
         """Flush, fsync, close, and finalize the sidecar. Returns the summary."""
@@ -189,9 +197,15 @@ class CsvRecorder:
                 self.last_timestamp - self.first_timestamp
                 if self.first_timestamp is not None and self.last_timestamp is not None else None
             ),
+            "effective_sampling_rate_hz": (
+                (self.rows_written + self.missing_packets - 1) / (self.last_timestamp - self.first_timestamp)
+                if self.first_timestamp is not None and self.last_timestamp and self.last_timestamp > self.first_timestamp
+                else None
+            ),
             "gap_events": self.gap_events,
             "missing_packets": self.missing_packets,
             "counter_repeats": self.repeat_events,
+            "counter_backsteps": self.backstep_events,
             "markers": self.marker_count,
             "scale_check_chunks": self.scale_verdicts or None,
             "first_timestamp_unix": self.first_timestamp,

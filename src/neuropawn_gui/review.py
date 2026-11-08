@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QComboBox, QLabel, QMainWindow, QVBoxLayout, QWidget
 
 from . import theme
-from .dsp import DISPLAY_FILTERS, NOTCH_OPTIONS, apply_display_filter
+from .dsp import DISPLAY_FILTERS, NOTCH_OPTIONS, apparent_line_hz, apply_display_filter
 from .recorder import sidecar_path
 from .scale import LEGACY, classify, legacy_to_corrected
 from .widgets import Panel, _style_plot
@@ -33,6 +33,16 @@ class Recording:
     @property
     def eeg(self) -> np.ndarray:
         return np.vstack([self.col(f"ch{i}_uV") for i in range(1, 9)])
+
+    @property
+    def fs_true(self) -> float | None:
+        """Board's real sample rate from a fit of host timestamps vs. sample index."""
+        idx = self.col("sample_index") + np.cumsum(np.clip(self.col("gap_before"), 0, None))
+        ts = self.col("timestamp_unix")
+        if len(ts) < 2 or ts[-1] - ts[0] < 5:
+            return None
+        slope = np.polyfit(idx, ts - ts[0], 1)[0]
+        return 1.0 / slope if slope > 0 else None
 
     @property
     def time_s(self) -> np.ndarray:
@@ -153,8 +163,9 @@ class ReviewWindow(QMainWindow):
         return "   ·   ".join(parts) + "      (scroll/drag to pan & zoom; filters affect display only)"
 
     def _redraw(self, *_):
-        y = apply_display_filter(self.rec.eeg, self.rec.fs, self.filter_combo.currentData(),
-                                 self.notch_combo.currentData())
+        notch = self.notch_combo.currentData()
+        notch = apparent_line_hz(notch, self.rec.fs, self.rec.fs_true) if notch else None
+        y = apply_display_filter(self.rec.eeg, self.rec.fs, self.filter_combo.currentData(), notch)
         for i, c in enumerate(self.curves):
             c.setData(self.t, y[i])
             vb = c.getViewBox()

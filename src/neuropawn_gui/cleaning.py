@@ -277,10 +277,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--frontal", default="1,2", help="1-based blink channels, comma separated ('' = none)")
     args = ap.parse_args(argv)
 
+    from .dsp import apparent_line_hz
+
     frontal = tuple(int(c) - 1 for c in args.frontal.split(",") if c.strip())
-    cfg = CleaningConfig(highpass_hz=args.hp or None, lowpass_hz=args.lp or None, notch_hz=args.notch or None,
-                         car=args.car, frontal_channels=frontal)
     rec = load_recording(args.csv)
+    notch = apparent_line_hz(args.notch, rec.fs, rec.fs_true) if args.notch else None
+    cfg = CleaningConfig(highpass_hz=args.hp or None, lowpass_hz=args.lp or None, notch_hz=notch,
+                         car=args.car, frontal_channels=frontal)
     res = clean_offline(rec.eeg, rec.fs, cfg, regress_blinks=not args.no_regress)
 
     out = args.csv.with_name(args.csv.stem + "_clean.csv")
@@ -295,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         si = rec.col("sample_index").astype(int)
         for j in range(res.data.shape[1]):
             w.writerow([si[j], t[j], *res.data[:, j].tolist(), int(res.artifact[j]), int(ep_bad[j]), int(ep_blink[j])])
-    meta = {"source": args.csv.name, "scale_note": rec.scale_note, "config": asdict(cfg),
+    meta = {"source": args.csv.name, "scale_note": rec.scale_note, "board_clock_hz": rec.fs_true, "config": asdict(cfg),
             "regress_blinks": not args.no_regress, "report": res.report}
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -303,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {out.name}")
     if rec.scale_note:
         print(f"  note: {rec.scale_note}")
+    if notch:
+        print(f"  notch tuned to {notch:.2f} Hz (board clock {rec.fs_true or rec.fs:.2f} Hz vs nominal {rec.fs:g})")
     print(f"  blinks: {r['blinks']} at {r['blink_times_s']} s")
     print(f"  epochs flagged (non-frontal p2p > {cfg.epoch_reject_p2p_uv:g} uV): {r['epochs_bad']}/{r['epochs']}, "
           f"with blinks: {r['epochs_with_blink']}")

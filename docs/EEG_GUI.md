@@ -26,11 +26,28 @@ Options: `--board knight|knight_imu|synthetic`, `--port /dev/cu.usbserial-XXXX`,
 
 Use **Synthetic demo** to try everything without the headset.
 
+## Connection check (do this before every recording)
+
+As soon as a session starts, each channel gets a badge next to its number, **✓ 92** (good, ≥80), **! 61** (fair, 50–79) or **✗ 0** (poor, <50), and the top bar shows **"✓ Signal 8/8 good"**. The **Signal Check** tab (opened automatically) lists each channel's problem and how to fix it. Aim for **8/8 ✓ and no red banner** before you press Record.
+
+The Knight doesn't report electrode impedance, so the score comes from the last 4 s of signal. The worst of these sets the score:
+
+| Check | Good | What a bad value usually means |
+|---|---|---|
+| 60 Hz hum (peak above nearby noise) | < 2 µV/√Hz | Poor contact. Press it in, part the hair, add paste. Check the ear clip |
+| Noise (1–40 Hz) | 2–40 µV | > 100: loose electrode, movement, jaw tension. < 0.5: flat (off or unplugged) |
+| Drift (< 1 Hz) | < 600 µV p-p | Electrode still settling, or the cable is being tugged |
+| Railed | < 90% of ±4190 µV | No contact at all |
+
+**Red banner: "ChX… are near-copies of each other."** Several channels carrying the same signal (r ≥ 0.95) means one floating electrode in the RLD loop is spreading its noise to the others. This is what happened in our eyes-open/closed session, where a loose Ch8 contaminated Ch1–6. Fix the channel the banner names first.
+
+Every recording's JSON stores the check as it was when you pressed Record (`board.signal_check_at_start`), so you can always tell how good the contact was.
+
 ## Screen layout
 
 | Area | What it shows |
 |---|---|
-| **Time Series** | 8 stacked channels in OpenBCI colors. Click a channel's number to hide it (display only). The right column shows µVrms over the last second, plus a railed warning when the raw signal is at ≥90% / ≥99% of the ADC's ±4190 µV range (usually means bad electrode contact). |
+| **Time Series** | 8 stacked channels in OpenBCI colors, each with a connection badge (✓/!/✗ + score). Click a channel's number to hide it (display only). The right column shows µVrms over the last second, plus a railed warning when the raw signal is at ≥90% / ≥99% of the ADC's ±4190 µV range (usually means bad electrode contact). |
 | **FFT Plot** | Amplitude spectrum (Welch, 0.5 Hz bins, last 4 s) per visible channel. |
 | **Band Power** | Relative delta/theta/alpha/beta/gamma power, averaged over visible channels. |
 | **Live Values** | Latest, mean, min, max, and standard deviation per channel over the last second, unfiltered (the same numbers the CSV gets), plus the raw lead-off bits. |
@@ -111,11 +128,109 @@ This runs the filters without time shift (zero-phase), detects blinks, and remov
 
 ```python
 from neuropawn_gui.cleaning import RealtimeCleaner, CleaningConfig
-rt = RealtimeCleaner(fs=125, cfg=CleaningConfig(car=True))
+from neuropawn_gui.dsp import apparent_line_hz
+notch = apparent_line_hz(60, 125, board_clock_hz)   # ~59.68 on the Knight (see "60 Hz hum")
+rt = RealtimeCleaner(fs=125, cfg=CleaningConfig(car=True, notch_hz=notch))
 clean, artifact = rt.process(chunk)   # chunk: (8, n) µV; artifact: (n,) bool
 ```
 
 Live filtering delays the signal slightly. A blink gets flagged about 80 ms after its true peak.
+
+## Drowsiness score and pre-sleep alert
+
+The **Drowsiness** tab shows a 0–100 score and fires an alert (a macOS notification and sound, optionally spoken) when the EEG shows the **pre-sleep pattern**: posterior alpha replaced by central theta. The top bar shows the score at all times. Each alert also writes **marker 90** into the recording.
+
+**How to use it:**
+1. Start a session and get the Signal Check to 8/8 ✓.
+2. Stay awake for the first **60 s** while it calibrates your personal baseline. About 30 s eyes open, then 30 s eyes closed, works well. Use **Recalibrate** for a new person or after re-seating electrodes.
+3. Use **Test alert** to check that notifications reach you. On macOS you may need to allow notifications for the terminal or Python.
+
+**What counts as pre-sleep.** Every 2 s, a 4 s window is labeled pre-sleep only if all of these hold:
+
+| Criterion | Threshold | Why |
+|---|---|---|
+| θ (4–8 Hz, C3/C4) ÷ α (8–13 Hz, P3/P4/O1/O2) | ≥ 1.0 | Alpha no longer dominates. AASM N1 rule: alpha *replaced by* 4–7 Hz activity |
+| θ vs. personal awake baseline | ≥ 2.0× | Theta has actually risen (Strijkstra et al. 2003; Hori sleep-onset stages) |
+| β (13–30 Hz) vs. baseline | ≤ 1.5× | Not attention-related theta, which comes with maintained beta. Drowsiness lowers beta (Lal & Craig 2002; Jap et al. 2009) |
+| No blink on F3/F4 (> 100 µV) | — | Blinking means eyes open and awake |
+| Clean signal | channels not ✗, < 200 µV | Artifacts and bad electrodes are excluded |
+
+**Score** = % of valid windows in the last 30 s that meet all five. An **alert fires at ≥ 50**, the same ">50% of a 30 s epoch" rule used to score N1. It then needs the score to drop below 25 and a 60 s cooldown before it can fire again.
+
+**Why not just θ/α?** On our own recordings θ/α is **1.3–2.1 in alert, eyes-open wakefulness**, because vision suppresses alpha, and 0.08–0.23 eyes closed. A bare ratio threshold would fire every time someone opens their eyes. Requiring theta to *rise* above baseline is what separates sleep onset from normal alpha attenuation.
+
+**Validation so far:**
+
+| Test | Score | Alert |
+|---|---|---|
+| Real sessions (eyes open, eyes closed, both full sessions) | 0 | none |
+| Normal alpha blocking (alpha −90%, theta unchanged) | 0 | none |
+| Focused attention (alpha −90%, theta ×2.5, beta ×2) | 0 | none |
+| Mild drowsiness (alpha −50%, theta ×1.5) | 20 | none |
+| Simulated pre-sleep (alpha −85%, theta ×2–3, beta −30%) | 87–100 | once, ~20 s after the pattern is established |
+
+**Limitations:**
+- **We have no real sleep-onset recordings yet.** The awake side is validated on real data; the pre-sleep side only on simulated transitions. Record a real drowsy session (lying down, late in the day, eyes closed) to confirm the 2× theta threshold, or test on the SADT driving dataset.
+- Detection lags by design: about 15–30 s, because the pattern must hold for most of a 30 s epoch.
+- It targets *eyes-closed* sleep onset. Drowsiness with the eyes open (e.g. a driver) shows up differently (alpha intrusions, slow blinks) and would need the camera features.
+- This is a research prototype, not a validated sleepiness detector or a safety device.
+
+## Night Drive: the driving task
+
+A deliberately boring night-time highway drive that lets participants get drowsy while the GUI watches their EEG in the background. When the detector fires, the drive is **interrupted by a full-screen alarm** until the driver presses SPACE.
+
+**Running a session (experimenter):**
+1. In the GUI: Start Session, then get the Signal Check to 8/8 ✓.
+2. On the **Drowsiness** tab, choose the length (default 30 min), tick **Fullscreen** for a real participant, and press **Launch driving task**. Recording starts automatically if it isn't already on.
+3. The game guides a **1-minute baseline** (30 s eyes open on a fixation cross, 30 s eyes closed until a tone), which recalibrates the detector. Then the drive starts.
+4. Leave the GUI running behind the game. The Drowsiness tab shows live driving stats (reaction time, lapses, lane departures, SDLP), and lapses and departures appear as ▲ on the score plot.
+5. When the drive ends the game shows a summary and closes. Stop the recording in the GUI.
+
+You can also start it on its own with `python run_game.py [--minutes 30] [--fullscreen]`. Start the GUI first, or there's no drowsiness detection.
+
+**Controls:** LEFT/RIGHT (or A/D, or a USB wheel/gamepad) steer · SPACE start/continue · ESC pause · F fullscreen · TAB experimenter overlay · K skip the baseline (intro screen).
+
+**Why it's monotonous on purpose:**
+- Night, an empty straight highway, constant 100 km/h, evenly spaced reflector posts, and a steady engine/road drone. This is the kind of monotony that produces "highway hypnosis".
+- No score, no reaction-time feedback, no music, and a minimal dashboard, because feedback and variety keep people alert.
+
+**The task (based on the Sustained-Attention Driving Task):**
+- Every 8–14 s the car slowly drifts out of the lane (0.55 m/s), and the driver steers it back.
+- Logged per drift: reaction time; a **lapse** if there's no correction within 4 s; a **lane departure** if the wheels cross the line; recovery time.
+- Logged continuously: lateral position at 10 Hz, and **SDLP** (how much the car weaves), the standard driving-drowsiness measure.
+
+These give behavioral ground truth to check the EEG detector against. Files go to `data/game_sessions/night_drive_<date>/` (`events.csv`, `telemetry.csv`, `session.json`), timestamped with the same Unix clock as the EEG recording.
+
+**Markers written into the EEG recording:**
+
+| Code | Event | Code | Event |
+|---|---|---|---|
+| 30 | drive started | 41 / 42 | drift starts left / right |
+| 31 / 32 | paused / resumed | 43 | driver responded (steered back) |
+| 33 | drive ended | 44 | lapse (no response within 4 s) |
+| 34 / 35 / 36 | baseline: eyes open / eyes closed / end | 45 | lane departure |
+| 90 | drowsiness alert | 46 | back in lane centre |
+| 91 | alert acknowledged by the driver | | |
+
+**Driver mode (microsleep alert).** For a driver, waiting until half of a 30 s epoch shows the pre-sleep pattern is too slow. The detector also alerts after **3 consecutive pre-sleep windows** (about 8 s of continuous pattern), in line with microsleep durations of 3–15 s (Boyle et al. 2008; Poudel et al. 2014). On our real awake recordings this added no false alarms. On simulated transitions it fires about 12 s sooner than the 30 s rule.
+
+**Keeping the GUI awake:** while the game covers the screen, macOS would normally throttle the hidden GUI (App Nap) and could let the system sleep during a long session. The GUI registers a user-initiated activity at startup to prevent both. You can see it in `pmset -g assertions`.
+
+## 60 Hz hum: what we found and what to do
+
+Measured on our three real sessions:
+
+- **The hum is electrode-specific, not common to all channels.** Each channel's hum has a different phase, and the bad channels are 10–300× worse than the good ones. It comes from poor contact (an impedance mismatch turns body-wide mains pickup into a channel-specific signal), which RLD can't cancel. **Ch8 got worse every session** (2.7 → 65 → 484 µV rms) and Ch7 is consistently second-worst, so the back-of-head electrodes are the problem.
+- **It's steady** (it varies only 1.1–1.2× within a session), so it comes from the surroundings plus contact, not from movement.
+- **It doesn't sit at 60.00 Hz in the data.** The Knight's clock runs at ~125.66 Hz, not the 125 Hz BrainFlow assumes, so hum shows up at **~59.68 Hz**. A fixed 60.00 Hz notch only removed 21 dB (saved files) / **10 dB (live)**. The app now measures the board clock during the session (status bar: "notch tuned to 59.68 Hz") and centers the notch there: **42–51 dB / 28–33 dB**, with the EEG bands untouched. The cleaner and the recording viewer do the same, using the file's timestamps.
+- Mains harmonics fold back into the EEG band (240 Hz lands at 11.27 Hz, inside alpha), but none were present at measurable levels. Our 11.25 Hz eyes-closed alpha peak is 0.75 Hz wide, so it's real alpha, not a hum line.
+
+**Fixing it at the source (best payoff first):**
+1. **Swap test for Ch8:** swap its electrode with a good channel's (e.g. Ch3). If the hum follows the electrode, the electrode or lead is bad. If it stays on Ch8, check the board side: pin on the **positive rail**, switch flicked **away** from the header.
+2. **Back-of-head contact (O1/O2):** part the hair under the electrode, add conductive paste, and adjust the comfort pads so the electrode presses on the scalp.
+3. **Ear clip (RLD/COMM):** snug, with a little paste. It's the reference and the RLD return for every channel.
+4. **Environment A/B test:** watch the Signal Check hum column for 20 s with the laptop charger plugged in, then 20 s unplugged. Also move away from power strips, monitors, and lamps, and keep the USB cable away from the electrode leads.
+5. **Don't leave a floating electrode in the RLD loop.** It injects its noise into every channel (our second session).
 
 ## Right-leg drive (RLD)
 

@@ -43,7 +43,21 @@ def _bandpass_sos(lo: float, hi: float, fs: float, order: int = 4):
     return signal.butter(order, [lo, hi], btype="bandpass", fs=fs, output="sos")
 
 
-@lru_cache(maxsize=16)
+def apparent_line_hz(mains_hz: float, fs_nominal: float, fs_true: float | None) -> float:
+    """Where mains hum actually lands in data labeled with the nominal sample rate.
+
+    BrainFlow labels Knight data as 125 Hz, but the board's clock runs ~0.5% fast
+    (125.64-125.71 Hz measured on our recordings). Every frequency therefore appears
+    ~0.5% low, and 60 Hz hum shows up at ~59.68 Hz. A notch at exactly 60.00 Hz misses
+    it: 21 dB rejection offline / 10 dB live, versus 42-51 / 28-33 dB when centered
+    correctly (measured on our real recordings).
+    """
+    if not fs_true or fs_true <= 0:
+        return mains_hz
+    return mains_hz * fs_nominal / fs_true
+
+
+@lru_cache(maxsize=64)
 def _notch_sos(f0: float, fs: float, q: float = 30.0):
     if f0 >= fs / 2:
         return None
@@ -59,7 +73,7 @@ def apply_display_filter(x: np.ndarray, fs: float, flt: DisplayFilter, notch_hz:
     y -= y.mean(axis=-1, keepdims=True)
     sections = []
     if notch_hz:
-        sos = _notch_sos(float(notch_hz), float(fs))
+        sos = _notch_sos(round(float(notch_hz), 2), float(fs))
         if sos is not None:
             sections.append(sos)
     if flt.kind == "band" and flt.band:

@@ -119,3 +119,18 @@ def test_bad_port_reports_error():
     st = eng.stats()
     assert st.state is State.ERROR
     assert "does-not-exist" in st.error
+
+
+def test_annotate_active_recording(tmp_path):
+    eng = AcquisitionEngine()
+    eng.connect(BOARDS_BY_KEY["synthetic"])
+    assert _wait_for(lambda: eng.stats().state is State.STREAMING)
+    path = tmp_path / "a.csv"
+    eng.start_recording(path, {"signal_check_at_start": None})
+    assert _wait_for(lambda: eng.stats().recording_path is not None)
+    eng.annotate_recording("night_drive_session", "night_drive_test")
+    time.sleep(0.3)
+    eng.disconnect()
+    assert eng.join(10)
+    meta = json.loads(sidecar_path(path).read_text())
+    assert meta["board"]["night_drive_session"] == "night_drive_test" and meta["clean_shutdown"] is True

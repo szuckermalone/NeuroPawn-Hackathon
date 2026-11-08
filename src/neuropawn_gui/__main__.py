@@ -25,7 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("NeuroPawn EEG")
     app.setStyle("Fusion")
+    app.setPalette(app.style().standardPalette())  # light palette even in macOS dark mode
     app.setStyleSheet(STYLESHEET)
+
+    from .macos import prevent_app_nap
+    prevent_app_nap()  # keep acquisition + drowsiness detection at full speed while the game covers the screen
 
     if args.review:
         from .review import ReviewWindow

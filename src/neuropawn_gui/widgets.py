@@ -17,6 +17,8 @@ from .dsp import BANDS, DISPLAY_FILTERS, NOTCH_OPTIONS
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#333")
 
+QUALITY_COLORS = {"good": theme.GREEN, "fair": theme.AMBER, "poor": theme.RED}
+
 WINDOW_OPTIONS = [1, 3, 5, 10, 20]
 SCALE_OPTIONS = ["Auto", 10, 25, 50, 100, 200, 500, 1000, 4200]
 
@@ -73,10 +75,17 @@ class ChannelRow(QWidget):
         self.button = QPushButton(str(idx + 1), objectName="ChannelButton")
         self.button.setCheckable(True)
         self.button.setChecked(True)
-        self.button.setToolTip(f"Show/hide channel {idx + 1} (display only; recording always keeps all channels)")
+        self.button.setToolTip(f"Turn channel {idx + 1} off/on: hides it and excludes it from the drowsiness detector "
+                               "(the recording always keeps all channels)")
         self.button.toggled.connect(self._on_toggle)
         self._paint_button(True)
         h.addWidget(self.button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.badge = QLabel("…", objectName="QualityBadge")
+        self.badge.setFixedWidth(46)
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.badge.setToolTip("Connection quality (0–100), from the last 4 s of signal")
+        h.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.plot = pg.PlotWidget()
         self.plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -110,6 +119,22 @@ class ChannelRow(QWidget):
     @property
     def visible(self) -> bool:
         return self.button.isChecked()
+
+    def set_quality(self, q) -> None:
+        if q is None:
+            self.badge.setText("…")
+            self.badge.setStyleSheet(f"color: {theme.MUTED}; background: {theme.PANEL_TITLE}; border-radius: 9px;")
+            self.badge.setToolTip("Measuring… (needs 2 s of signal)")
+            return
+        bg = QUALITY_COLORS[q.status]
+        self.badge.setText(f"{q.symbol} {q.score}")
+        self.badge.setStyleSheet(f"color: white; background: {bg}; border-radius: 9px; font-weight: 700; padding: 2px 0;")
+        m = q.metrics
+        self.badge.setToolTip(
+            f"Ch{q.channel}: {q.status.upper()} ({q.score}/100)" + (f", {q.reason}" if q.reason else "") +
+            f"\n60 Hz hum: {m['line_uv_rthz']:.2f} µV/√Hz (good < 2)"
+            f"\nNoise 1–40 Hz: {m['std_uv']:.1f} µV (good 2–40)"
+            f"\nDrift: {m['drift_uv']:.0f} µV p-p (good < 600)")
 
     def show_x_axis(self, show: bool) -> None:
         ax = self.plot.getPlotItem().getAxis("bottom")
@@ -199,6 +224,11 @@ class TimeSeriesPanel(Panel):
             r.marker_curve.setData([], [])
             r.artifact_curve.setData([], [])
             r.readout.setText("—\n")
+            r.set_quality(None)
+
+    def set_quality(self, report) -> None:
+        for r in self.rows:
+            r.set_quality(None if report is None else report.channels[r.idx])
 
     # drawing ----------------------------------------------------------------
     def update_plots(self, shown: np.ndarray, raw: np.ndarray, markers: np.ndarray, fs: float,
@@ -393,6 +423,277 @@ class LiveValuesWidget(QWidget):
             for c in range(1, len(self.COLS)):
                 self.table.item(i, c).setText("—")
         self.footer.setText("")
+
+
+# ----------------------------------------------------------------------------- signal check
+class SignalCheckWidget(QWidget):
+    COLS = ["Ch", "Status", "Score", "Issue", "60 Hz µV/√Hz", "Noise µV", "Drift µV"]
+    TIPS = {
+        "60 Hz hum": "Press the electrode firmly against the scalp, part the hair, add a little paste. "
+                     "Check that the ear clip (RLD/COMM) is snug.",
+        "too noisy": "Sit still and relax your jaw. Re-seat the electrode if it stays noisy.",
+        "drifting": "Give it 10–20 s to settle after adjusting. Avoid tugging the cables.",
+        "flat": "Channel may still be configuring, or the electrode lead is unplugged. Check the pin "
+                "is on the positive rail.",
+        "railed": "No contact. Re-seat the electrode, check the lead, and check the ear clip.",
+        "copies": "Fix the channel with the lowest score first; one loose electrode can contaminate the rest.",
+    }
+
+    def __init__(self):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        from PyQt6.QtWidgets import QCheckBox
+        self.ignore_hum_cb = QCheckBox("Ignore 60 Hz hum (it's filtered out before analysis; recordings stay raw)")
+        self.ignore_hum_cb.setChecked(True)
+        self.ignore_hum_cb.setToolTip("When on, channels are judged on flat/railed/drift/noise only. Turn off to use the "
+                                      "hum column for fixing electrode contact.")
+        v.addWidget(self.ignore_hum_cb)
+        self.headline = QLabel("Start a session to check electrode contact.")
+        self.headline.setStyleSheet("font-size: 15px; font-weight: 700;")
+        v.addWidget(self.headline)
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet(f"color: white; background: {theme.RED}; padding: 6px; border-radius: 3px;")
+        self.warning.hide()
+        v.addWidget(self.warning)
+        self.table = QTableWidget(NUM_EEG, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        for i in range(NUM_EEG):
+            item = QTableWidgetItem(f" {i + 1} ")
+            item.setForeground(QColor("white"))
+            item.setBackground(QColor(theme.CHANNEL_COLORS[i]))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 0, item)
+            for c in range(1, len(self.COLS)):
+                self.table.setItem(i, c, QTableWidgetItem("—"))
+        v.addWidget(self.table, 1)
+        self.tips = QLabel("")
+        self.tips.setWordWrap(True)
+        self.tips.setStyleSheet(f"color: {theme.MUTED}; font-size: 11px;")
+        v.addWidget(self.tips)
+
+    def update_report(self, report) -> None:
+        if report is None:
+            self.headline.setText("Measuring… (needs 2 s of signal)")
+            self.headline.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {theme.MUTED};")
+            return
+        n_good, n = report.n_good, len(report.channels)
+        color = theme.GREEN if n_good == n and not report.warning else theme.AMBER if n_good >= n - 2 else theme.RED
+        verdict = "Ready to record" if n_good == n and not report.warning else "Fix the flagged channels before recording"
+        self.headline.setText(f"{n_good}/{n} channels good · {verdict}")
+        self.headline.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {color};")
+        self.warning.setVisible(bool(report.warning))
+        self.warning.setText(report.warning or "")
+        tips = []
+        for i, q in enumerate(report.channels):
+            st = self.table.item(i, 1)
+            st.setText(f"{q.symbol}  {q.status}")
+            st.setForeground(QColor(QUALITY_COLORS[q.status]))
+            self.table.item(i, 2).setText(str(q.score))
+            self.table.item(i, 3).setText(q.reason or "OK")
+            m = q.metrics
+            self.table.item(i, 4).setText(f"{m['line_uv_rthz']:.2f}")
+            self.table.item(i, 5).setText(f"{m['std_uv']:.1f}")
+            self.table.item(i, 6).setText(f"{m['drift_uv']:.0f}")
+            for key, tip in self.TIPS.items():
+                if q.reason.startswith(key) and tip not in tips:
+                    tips.append(tip)
+        self.tips.setText("Tips: " + " ".join(tips) if tips else
+                          "Scores use the last 4 s: 60 Hz hum, noise level, drift, flat/railed signal. "
+                          "Hover a channel badge for details.")
+
+    def clear(self) -> None:
+        self.headline.setText("Start a session to check electrode contact.")
+        self.headline.setStyleSheet("font-size: 15px; font-weight: 700;")
+        self.warning.hide()
+        self.tips.setText("")
+        for i in range(NUM_EEG):
+            for c in range(1, len(self.COLS)):
+                self.table.item(i, c).setText("—")
+
+
+# ----------------------------------------------------------------------------- drowsiness
+class DrowsinessWidget(QWidget):
+    """Score, state, ratio readouts, history plot, and alert controls."""
+
+    recalibrate_requested = pyqtSignal()
+    test_alert_requested = pyqtSignal()
+    launch_game_requested = pyqtSignal(float, bool)
+
+    def __init__(self):
+        from PyQt6.QtWidgets import QCheckBox, QProgressBar, QSpinBox
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 4, 6, 4)
+
+        top = QHBoxLayout()
+        self.score_label = QLabel("—")
+        self.score_label.setFixedWidth(118)
+        self.score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.score_label.setStyleSheet("font-size: 40px; font-weight: 800; border-radius: 8px; "
+                                       f"background: {theme.PANEL_TITLE}; color: {theme.MUTED};")
+        self.score_label.setToolTip("Drowsiness score: % of the last 30 s showing the pre-sleep pattern "
+                                    "(theta replacing alpha). Alert at 50.")
+        top.addWidget(self.score_label)
+        info = QVBoxLayout()
+        self.state_label = QLabel("Start a session")
+        self.state_label.setStyleSheet("font-size: 16px; font-weight: 700;")
+        info.addWidget(self.state_label)
+        self.detail_label = QLabel("")
+        self.detail_label.setStyleSheet(f"color: {theme.MUTED}; font-family: Menlo, monospace; font-size: 11px;")
+        info.addWidget(self.detail_label)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("Calibrating… stay awake: eyes open, then closed  %p%")
+        self.progress.setFixedHeight(16)
+        info.addWidget(self.progress)
+        top.addLayout(info, 1)
+        v.addLayout(top)
+
+        self.banner = QLabel("")
+        self.banner.setWordWrap(True)
+        self.banner.setStyleSheet(f"color: white; background: {theme.RED}; padding: 6px; border-radius: 3px; font-weight: 700;")
+        self.banner.setMinimumHeight(48)
+        self.banner.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.banner.hide()
+        v.addWidget(self.banner)
+
+        self.plot = pg.PlotWidget()
+        self.plot.setMinimumHeight(170)  # the tab scrolls on small screens instead of squeezing this
+        pi = self.plot.getPlotItem()
+        _style_plot(pi)
+        pi.setMouseEnabled(x=False, y=False)
+        pi.setLabel("left", "Score")
+        pi.setLabel("bottom", "Time (s)")
+        pi.setYRange(0, 100, padding=0.02)
+        pi.addItem(pg.InfiniteLine(50, angle=0, pen=pg.mkPen(theme.RED, width=1, style=Qt.PenStyle.DashLine),
+                                   label="alert 50", labelOpts={"position": 0.05, "color": theme.RED}))
+        self.score_curve = pi.plot(pen=pg.mkPen(theme.RED, width=2), fillLevel=0, brush=pg.mkBrush(224, 56, 45, 40))
+        self.ratio_view = pg.ViewBox()
+        pi.showAxis("right")
+        pi.scene().addItem(self.ratio_view)
+        pi.getAxis("right").linkToView(self.ratio_view)
+        pi.getAxis("right").setLabel("θ/α ratio", color=theme.CHANNEL_COLORS[2])
+        self.ratio_view.setXLink(pi)
+        self.ratio_view.setYRange(0, 4)
+        self.ratio_curve = pg.PlotDataItem(pen=pg.mkPen(theme.CHANNEL_COLORS[2], width=1.2))
+        self.ratio_view.addItem(self.ratio_curve)
+        self.ratio_view.addItem(pg.InfiniteLine(1.0, angle=0, pen=pg.mkPen(theme.CHANNEL_COLORS[2], style=Qt.PenStyle.DotLine)))
+        # behaviour from the driving game: lapses (red) and lane departures (amber) along the top
+        self.events_scatter = pg.ScatterPlotItem(size=10, pen=None, symbol="t")
+        pi.addItem(self.events_scatter)
+        self._behaviour: list[tuple[float, str]] = []
+        pi.vb.sigResized.connect(lambda: self.ratio_view.setGeometry(pi.vb.sceneBoundingRect()))
+        v.addWidget(self.plot, 1)
+
+        row = QHBoxLayout()
+        self.alerts_cb = QCheckBox("Send alerts")
+        self.alerts_cb.setChecked(True)
+        self.speak_cb = QCheckBox("Speak alert")
+        row.addWidget(self.alerts_cb)
+        row.addWidget(self.speak_cb)
+        row.addStretch(1)
+        self.recal_btn = QPushButton("Recalibrate (60 s)")
+        self.recal_btn.setToolTip("Re-measure this person's awake baseline. Stay awake: ~30 s eyes open, ~30 s eyes closed.")
+        self.recal_btn.clicked.connect(self.recalibrate_requested.emit)
+        self.test_btn = QPushButton("Test alert")
+        self.test_btn.clicked.connect(self.test_alert_requested.emit)
+        row.addWidget(self.recal_btn)
+        row.addWidget(self.test_btn)
+        v.insertLayout(1, row)  # alert controls right under the score, always visible
+        game = QHBoxLayout()
+        title = QLabel("Night Drive")
+        title.setStyleSheet("font-weight: 700;")
+        game.addWidget(title)
+        self.game_btn = QPushButton("Launch driving task")
+        self.game_btn.setToolTip("Opens the monotonous driving task. This GUI keeps the headset and interrupts the "
+                                 "drive when it detects the pre-sleep pattern. Recording starts automatically.")
+        self.game_btn.clicked.connect(lambda: self.launch_game_requested.emit(float(self.minutes_spin.value()),
+                                                                              self.fullscreen_cb.isChecked()))
+        self.minutes_spin = QSpinBox()
+        self.minutes_spin.setRange(1, 180)
+        self.minutes_spin.setValue(30)
+        self.minutes_spin.setSuffix(" min")
+        self.fullscreen_cb = QCheckBox("Fullscreen")
+        game.addWidget(self.game_btn)
+        game.addWidget(self.minutes_spin)
+        game.addWidget(self.fullscreen_cb)
+        game.addStretch(1)
+        v.addLayout(game)
+        self.game_status = QLabel("Not running.")
+        self.game_status.setStyleSheet(f"color: {theme.MUTED}; font-size: 11px;")
+        self.game_status.setWordWrap(True)
+        v.addWidget(self.game_status)
+
+        note = QLabel("Research prototype, not a safety device. Fires when theta has replaced alpha and risen ≥2× over "
+                      "baseline for >50% of 30 s (sleep-onset criterion) or for ~8 s straight (microsleep). Eyes-open "
+                      "alpha blocking, blinking, and attention-related theta don't count. ▲ red = lapse, ▲ amber = "
+                      "lane departure in the driving task.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {theme.MUTED}; font-size: 10px;")
+        v.addWidget(note)
+        self.clear()
+
+    def clear(self) -> None:
+        self.score_label.setText("—")
+        self.score_label.setStyleSheet("font-size: 40px; font-weight: 800; border-radius: 8px; "
+                                       f"background: {theme.PANEL_TITLE}; color: {theme.MUTED};")
+        self.state_label.setText("Start a session")
+        self.detail_label.setText("")
+        self.progress.setValue(0)
+        self.progress.hide()
+        self.banner.hide()
+        self.score_curve.setData([], [])
+        self.ratio_curve.setData([], [])
+        self._behaviour = []
+        self.events_scatter.setData([], [])
+
+    def add_behaviour_event(self, t: float, kind: str) -> None:
+        self._behaviour.append((t, kind))
+
+    def show_alert(self, text: str) -> None:
+        self.banner.setText(text)
+        self.banner.show()
+
+    def update_state(self, s, t0: float) -> None:
+        cal = s.phase == "calibrating"
+        self.progress.setVisible(cal)
+        if cal:
+            self.progress.setValue(int(s.calibration_progress * 100))
+        if s.score is None:
+            self.score_label.setText("—")
+            color, fg = theme.PANEL_TITLE, theme.MUTED
+        else:
+            self.score_label.setText(f"{s.score:.0f}")
+            color = theme.RED if s.score >= 50 else theme.AMBER if s.score >= 25 else theme.GREEN
+            fg = "white"
+        self.score_label.setStyleSheet(f"font-size: 40px; font-weight: 800; border-radius: 8px; background: {color}; color: {fg};")
+        self.state_label.setText(s.label)
+        parts = []
+        if s.ratio is not None:
+            parts.append(f"θ/α {s.ratio:5.2f} (≥1.0)")
+        if s.theta_rel is not None:
+            parts.append(f"θ {s.theta_rel:4.1f}× base (≥2.0)")
+        if s.beta_rel is not None:
+            parts.append(f"β {s.beta_rel:4.1f}× base (≤1.5)")
+        self.detail_label.setText("   ".join(parts))
+        if s.history:
+            h = np.array([(t, np.nan if sc is None else sc, np.nan if r is None else r) for t, sc, r in s.history])
+            x = h[:, 0] - t0
+            self.score_curve.setData(x, np.nan_to_num(h[:, 1], nan=0.0), connect="finite")
+            self.ratio_curve.setData(x, np.clip(h[:, 2], 0, 4), connect="finite")
+        if self._behaviour:
+            colors = {"lapse": theme.RED, "lane_departure": theme.AMBER}
+            self.events_scatter.setData(
+                [{"pos": (tb - t0, 96 if k == "lapse" else 90), "brush": pg.mkBrush(colors.get(k, theme.MUTED))}
+                 for tb, k in self._behaviour])
 
 
 # ----------------------------------------------------------------------------- IMU
