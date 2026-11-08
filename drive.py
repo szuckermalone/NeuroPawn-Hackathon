@@ -35,6 +35,8 @@ def run(args):
         start = time.perf_counter()
         due = start + 12
         current = None
+        onset = None
+        base = None
         completed = []
         held = set()
         axis_ready = True
